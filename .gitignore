@@ -1,0 +1,10 @@
+# real employer runbooks + redaction map: local only, never pushed
+corpus/
+# vector index (rebuildable)
+project1-rca-assistant/index_store*/
+data/raw/
+*.log
+__pycache__/
+.venv/
+NOTES_*.md
+tools/redact_patterns.local.json
