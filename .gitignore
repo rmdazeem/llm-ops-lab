@@ -8,3 +8,4 @@ __pycache__/
 .venv/
 NOTES_*.md
 tools/redact_patterns.local.json
+evals/results.sqlite

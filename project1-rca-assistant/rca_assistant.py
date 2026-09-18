@@ -26,17 +26,31 @@ CORPUS   = Path(os.environ.get("RCA_CORPUS", ROOT / "sample_corpus"))   # set RC
 ALERTS   = ROOT / "data" / "alerts.json"
 INDEX_DIR = ROOT / "project1-rca-assistant" / f"index_store_{CORPUS.name}"
 TOP_K = 3
+PROMPT_VERSION = "v2"        # bump when SYSTEM_PROMPT / TOP_K / chunking / json_mode changes — evals are compared per version
+LAST_TRACE_ID = None         # set by answer(); lets the eval runner link a score to its trace
 
-Settings.llm = Ollama(model="qwen2.5:7b", request_timeout=600.0, temperature=0.1)
+# v2: json_mode=True makes Ollama constrain the output to valid JSON (eval run v1: 1 of 7 answers was unparseable)
+Settings.llm = Ollama(model="qwen2.5:7b", request_timeout=600.0, temperature=0.1, json_mode=True)
 Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
 Settings.node_parser = SentenceSplitter(chunk_size=700, chunk_overlap=80)
 
+# v1 -> v2 changes (from eval run 20260918T103812Z): root causes were generic / restated the question,
+# and next_steps sometimes paraphrased instead of quoting the runbook.
 SYSTEM_PROMPT = """You are an SRE assistant for an AIOps platform (Nomad, Consul, Docker, HAProxy,
 OpenSearch, Percona MySQL, Keycloak, OpenTelemetry). Answer ONLY from the runbook excerpts and alerts given.
 If the evidence is insufficient, say so — never invent hosts, commands or causes.
+
+Rules for the answer:
+- root_cause: name the failing COMPONENT and the MECHANISM (what broke and why), in one or two sentences.
+  Never restate the alert or the question. Bad: "HAProxy backend is DOWN on host-01".
+  Good: "The app-node service behind the backend is not listening on 9998 (or its health-check path changed), so HAProxy marks it DOWN."
+- evidence: the specific alert lines you relied on, copied from RECENT ALERTS.
+- next_steps: concrete commands or checks copied from the runbook excerpts, in the order to run them.
+- citations: the runbook file names you actually used, each listed once.
+- confidence: "high" only if both alerts and a runbook support the cause; "low" if evidence is insufficient.
+
 Return STRICT JSON with exactly these keys:
-{"root_cause": str, "evidence": [str], "next_steps": [str], "citations": [str], "confidence": "low|medium|high"}
-citations = the runbook file names you used. next_steps = concrete commands or checks, in order."""
+{"root_cause": str, "evidence": [str], "next_steps": [str], "citations": [str], "confidence": "low|medium|high"}"""
 
 
 def build_or_load_index():
@@ -64,9 +78,12 @@ def matching_alerts(question, limit=8):
 
 
 def answer(index, question):
+  global LAST_TRACE_ID
   with tracer.start_as_current_span("rca.question") as root:            # 1 trace per question
+    LAST_TRACE_ID = format(root.get_span_context().trace_id, "032x")
     root.set_attribute("rca.question", question)
     root.set_attribute("rca.corpus", CORPUS.name)
+    root.set_attribute("rca.prompt_version", PROMPT_VERSION)
 
     with tracer.start_as_current_span("rca.retrieve") as sp:            # embed question + vector search
         retriever = index.as_retriever(similarity_top_k=TOP_K)
@@ -108,6 +125,8 @@ def answer(index, question):
             data = json.loads(m.group(0)) if m else None
         except json.JSONDecodeError:
             data = None
+        if data and isinstance(data.get("citations"), list):
+            data["citations"] = list(dict.fromkeys(data["citations"]))   # dedupe, keep order (v2)
         sp.set_attribute("rca.valid_json", data is not None)
 
     root.set_attribute("rca.valid_json", data is not None)
