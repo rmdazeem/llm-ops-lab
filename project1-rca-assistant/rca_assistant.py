@@ -20,13 +20,14 @@ from llama_index.embeddings.ollama import OllamaEmbedding
 import os
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tracing                                          # Project 2: OpenTelemetry spans per question
+import guardrails as gr                                 # Project 2d: input / retrieval / output guards
 tracer = tracing.init("rca-assistant")
 ROOT     = Path(__file__).resolve().parents[1]          # repo root, wherever it is cloned
 CORPUS   = Path(os.environ.get("RCA_CORPUS", ROOT / "sample_corpus"))   # set RCA_CORPUS=E:\heal-llm-ops-lab\corpus for the private runbooks
 ALERTS   = ROOT / "data" / "alerts.json"
 INDEX_DIR = ROOT / "project1-rca-assistant" / f"index_store_{CORPUS.name}"
 TOP_K = 3
-PROMPT_VERSION = "v2"        # bump when SYSTEM_PROMPT / TOP_K / chunking / json_mode changes — evals are compared per version
+PROMPT_VERSION = "v3"        # v3 = v2 prompt + guardrails (2d). bump when SYSTEM_PROMPT / TOP_K / chunking / json_mode changes — evals are compared per version
 LAST_TRACE_ID = None         # set by answer(); lets the eval runner link a score to its trace
 
 # v2: json_mode=True makes Ollama constrain the output to valid JSON (eval run v1: 1 of 7 answers was unparseable)
@@ -81,9 +82,20 @@ def answer(index, question):
   global LAST_TRACE_ID
   with tracer.start_as_current_span("rca.question") as root:            # 1 trace per question
     LAST_TRACE_ID = format(root.get_span_context().trace_id, "032x")
-    root.set_attribute("rca.question", question)
     root.set_attribute("rca.corpus", CORPUS.name)
     root.set_attribute("rca.prompt_version", PROMPT_VERSION)
+
+    # --- guard 1: input (secrets blocked, PII/IPs redacted BEFORE the question is logged or prompted) ---
+    g_in = gr.input_guard(question)
+    question = g_in["question"]                                          # redacted form is the only one that travels
+    root.set_attribute("rca.question", question)
+    root.set_attribute("guardrail.input", g_in["reason"])
+    root.set_attribute("guardrail.redactions", g_in["redactions"])
+    if g_in["action"] == "block":
+        root.set_attribute("guardrail.action", "block_secret_request")
+        data = gr.refusal("secret_request")
+        root.set_attribute("rca.valid_json", True); root.set_attribute("rca.confidence", "low"); root.set_attribute("rca.alerts_matched", 0)
+        return data, json.dumps(data), [], [], 0.0                       # no retrieval, no LLM call
 
     with tracer.start_as_current_span("rca.retrieve") as sp:            # embed question + vector search
         retriever = index.as_retriever(similarity_top_k=TOP_K)
@@ -91,6 +103,14 @@ def answer(index, question):
         sp.set_attribute("rca.top_k", TOP_K)
         sp.set_attribute("rca.files", [n.metadata.get("file_name") for n in nodes])
         sp.set_attribute("rca.scores", [round(n.score, 3) for n in nodes])
+        # --- guard 2: retrieval similarity threshold (refuse without spending an LLM call) ---
+        g_ret = gr.retrieval_guard(nodes)
+        sp.set_attribute("guardrail.retrieval", g_ret["reason"]); sp.set_attribute("guardrail.best_score", g_ret["best_score"])
+    if g_ret["action"] == "block":
+        root.set_attribute("guardrail.action", "block_low_similarity")
+        data = gr.refusal("low_similarity")
+        root.set_attribute("rca.valid_json", True); root.set_attribute("rca.confidence", "low"); root.set_attribute("rca.alerts_matched", 0)
+        return data, json.dumps(data), nodes, [], 0.0
     runbook_ctx = "\n\n".join(
         f"--- runbook: {n.metadata.get('file_name')} (score {n.score:.2f}) ---\n{n.get_content()}" for n in nodes)
 
@@ -125,11 +145,21 @@ def answer(index, question):
             data = json.loads(m.group(0)) if m else None
         except json.JSONDecodeError:
             data = None
-        if data and isinstance(data.get("citations"), list):
-            data["citations"] = list(dict.fromkeys(data["citations"]))   # dedupe, keep order (v2)
+        # --- guard 3: output contract (pydantic) + citations limited to files the model actually saw ---
+        g_out = gr.validate_output(data, [n.metadata.get("file_name") for n in nodes])
+        sp.set_attribute("guardrail.output", "ok" if g_out["ok"] else "invalid")
+        sp.set_attribute("guardrail.citations_dropped", g_out["citations_dropped"])
+        if g_out["ok"]:
+            data = g_out["data"]
+        else:
+            sp.set_attribute("guardrail.output_errors", g_out["errors"][:5])
+            data = None
         sp.set_attribute("rca.valid_json", data is not None)
 
-    root.set_attribute("rca.valid_json", data is not None)
+    root.set_attribute("guardrail.action", "allow" if data is not None else "block_invalid_output")
+    if data is None:
+        data = gr.refusal("invalid_output")                             # never hand a raw/None answer to a user
+    root.set_attribute("rca.valid_json", g_out["ok"])
     root.set_attribute("rca.confidence", (data or {}).get("confidence", "n/a"))
     root.set_attribute("rca.alerts_matched", len(alerts))
     return data, raw, nodes, alerts, latency
