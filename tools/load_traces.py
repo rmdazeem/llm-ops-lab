@@ -35,6 +35,11 @@ MAPPING = {
                     "system":   {"type": "keyword"},
                     "response": {"properties": {"finish_reason": {"type": "keyword"}}},
                 }},
+                "guardrail": {"properties": {                       # 2d: explicit keyword mapping — dynamic mapping made these `text`
+                    "action": {"type": "keyword"}, "input": {"type": "keyword"}, "retrieval": {"type": "keyword"},
+                    "output": {"type": "keyword"}, "redactions": {"type": "integer"}, "best_score": {"type": "float"},
+                    "citations_dropped": {"type": "integer"}, "output_errors": {"type": "keyword"},
+                }},
                 "rca": {"properties": {
                     "question":       {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 512}}},
                     "corpus":         {"type": "keyword"},
@@ -66,6 +71,8 @@ def http(method, path, body=None):
 
 
 def ensure_index():
+    if "--recreate" in sys.argv:                       # mapping changed -> drop and rebuild (JSONL is the source of truth)
+        http("DELETE", f"/{INDEX}")
     code, _ = http("HEAD", f"/{INDEX}")
     if code == 200:
         return "exists"
