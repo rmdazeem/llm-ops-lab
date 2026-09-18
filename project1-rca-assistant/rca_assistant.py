@@ -9,7 +9,8 @@ Flow:  question -> embed -> top-K runbook chunks (vector search)
        question -> keyword match -> matching alerts from data/alerts.json
        [runbook chunks + alerts + question] -> qwen2.5:7b -> JSON RCA with citations
 """
-import json, re, sys, io, time
+import json, re, sys, io, time, warnings
+warnings.filterwarnings("ignore", message=".*AsyncOpenSearch.close.*")   # llama-index opensearch client never awaits close() at exit
 from pathlib import Path
 
 from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, Settings, StorageContext, load_index_from_storage
@@ -21,6 +22,7 @@ import os
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tracing                                          # Project 2: OpenTelemetry spans per question
 import guardrails as gr                                 # Project 2d: input / retrieval / output guards
+import alert_store                                      # Project 3a: alerts from OpenSearch (JSON fallback)
 tracer = tracing.init("rca-assistant")
 ROOT     = Path(__file__).resolve().parents[1]          # repo root, wherever it is cloned
 CORPUS   = Path(os.environ.get("RCA_CORPUS", ROOT / "sample_corpus"))   # set RCA_CORPUS=E:\heal-llm-ops-lab\corpus for the private runbooks
@@ -54,12 +56,51 @@ Return STRICT JSON with exactly these keys:
 {"root_cause": str, "evidence": [str], "next_steps": [str], "citations": [str], "confidence": "low|medium|high"}"""
 
 
+VECTOR_STORE = os.environ.get("RCA_VECTOR_STORE", "opensearch")     # "opensearch" (3b, default) | "local" (in-memory files)
+OS_URL = os.environ.get("OPENSEARCH_URL", "http://localhost:9200")
+KNN_INDEX = f"runbooks-{CORPUS.name}"                                 # one k-NN index per corpus
+EMBED_DIM = 768                                                       # nomic-embed-text
+
+
+def _load_docs():
+    return SimpleDirectoryReader(str(CORPUS), recursive=True, required_exts=[".md", ".sh"],
+                                 exclude=["REDACTION_MAP.json"]).load_data()
+
+
+def _opensearch_index():
+    """3b: vectors live in OpenSearch (knn_vector, Lucene HNSW, cosine). Built once; later runs just attach."""
+    from llama_index.vector_stores.opensearch import OpensearchVectorClient, OpensearchVectorStore
+    from opensearchpy import OpenSearch
+    os_client = OpenSearch(OS_URL, timeout=30)
+    exists = os_client.indices.exists(index=KNN_INDEX)
+    count = os_client.count(index=KNN_INDEX)["count"] if exists else 0
+    vclient = OpensearchVectorClient(
+        OS_URL, KNN_INDEX, EMBED_DIM, embedding_field="embedding", text_field="content",
+        method={"name": "hnsw", "space_type": "cosinesimil", "engine": "lucene",      # OpenSearch 3.x has no nmslib engine
+                "parameters": {"ef_construction": 256, "m": 48}},
+    )
+    store = OpensearchVectorStore(vclient)
+    if count:
+        print(f"[index] attaching to OpenSearch k-NN index {KNN_INDEX} ({count} chunks)")
+        return VectorStoreIndex.from_vector_store(store)
+    print(f"[index] building OpenSearch k-NN index {KNN_INDEX} from {CORPUS} (first run only) ...")
+    t = time.time()
+    index = VectorStoreIndex.from_documents(_load_docs(), storage_context=StorageContext.from_defaults(vector_store=store),
+                                            show_progress=True)
+    print(f"[index] indexed in {time.time()-t:.0f}s -> OpenSearch {KNN_INDEX} ({os_client.count(index=KNN_INDEX)['count']} chunks)")
+    return index
+
+
 def build_or_load_index():
+    if VECTOR_STORE == "opensearch":
+        try:
+            return _opensearch_index()
+        except Exception as e:                                         # OpenSearch down -> fall back to local files
+            print(f"[index] OpenSearch vector store unavailable ({type(e).__name__}: {str(e)[:80]}) -> local index")
     if INDEX_DIR.exists():
         return load_index_from_storage(StorageContext.from_defaults(persist_dir=str(INDEX_DIR)))
-    print(f"[index] building from {CORPUS} (first run only) ...")
-    docs = SimpleDirectoryReader(str(CORPUS), recursive=True, required_exts=[".md", ".sh"],
-                                 exclude=["REDACTION_MAP.json"]).load_data()
+    print(f"[index] building local index from {CORPUS} (first run only) ...")
+    docs = _load_docs()
     t = time.time()
     index = VectorStoreIndex.from_documents(docs, show_progress=True)
     index.storage_context.persist(persist_dir=str(INDEX_DIR))
@@ -100,7 +141,11 @@ def answer(index, question):
     with tracer.start_as_current_span("rca.retrieve") as sp:            # embed question + vector search
         retriever = index.as_retriever(similarity_top_k=TOP_K)
         nodes = retriever.retrieve(question)
+        if VECTOR_STORE == "opensearch":                                 # Lucene cosinesimil score = (1 + cos) / 2 -> back to raw cosine
+            for n in nodes:                                              # so SIM_THRESHOLD keeps the same meaning on both backends
+                n.score = 2 * n.score - 1
         sp.set_attribute("rca.top_k", TOP_K)
+        sp.set_attribute("rca.vector_store", VECTOR_STORE)
         sp.set_attribute("rca.files", [n.metadata.get("file_name") for n in nodes])
         sp.set_attribute("rca.scores", [round(n.score, 3) for n in nodes])
         # --- guard 2: retrieval similarity threshold (refuse without spending an LLM call) ---
@@ -114,9 +159,11 @@ def answer(index, question):
     runbook_ctx = "\n\n".join(
         f"--- runbook: {n.metadata.get('file_name')} (score {n.score:.2f}) ---\n{n.get_content()}" for n in nodes)
 
-    with tracer.start_as_current_span("rca.match_alerts") as sp:        # keyword match over alerts.json
-        alerts = matching_alerts(question)
+    with tracer.start_as_current_span("rca.match_alerts") as sp:        # 3a: OpenSearch query (host/service filters + fuzzy text)
+        alerts, meta = alert_store.search_alerts(question)
         sp.set_attribute("rca.alerts_matched", len(alerts))
+        sp.set_attribute("rca.alerts_source", meta["source"])
+        sp.set_attribute("rca.alerts_hosts", meta["parsed"]["hosts"]); sp.set_attribute("rca.alerts_services", meta["parsed"]["services"])
     alert_ctx = "\n".join(f"- [{a['timestamp']}] {a['severity'].upper()} {a['message']} (status {a['status']})"
                           for a in alerts) or "- (no matching alerts in the last 7 days)"
 
