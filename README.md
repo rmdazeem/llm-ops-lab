@@ -53,6 +53,15 @@ python project1-rca-assistant/rca_assistant.py            # interactive; first r
 python project1-rca-assistant/rca_assistant.py "OpenSearch cluster is RED on host-07, what do I check first?"
 ```
 
+## Measured, not claimed
+
+![Hallucination rate by prompt version — v1 28.6%, v2 0%](grafana/hallucination-rate-v1-v2.png)
+
+Every question is an OpenTelemetry trace (GenAI semantic conventions) → OpenSearch → Grafana. An eval harness
+(`evals/run_evals.py`) grades a golden set with deterministic checks + an LLM judge and stores results in SQLite and
+OpenSearch. Prompt v1 measured **28.6 %** hallucination; v2 (Ollama `json_mode`, stricter root-cause rules, fairer judge
+rubric) measured **0 %** on the disputed questions. Both prompt and judge are versioned so the two effects can be separated.
+
 ## Findings from the first eval pass
 
 - The model was faithful to the runbooks; one *runbook* was stale (systemd commands for a containerised service) and
