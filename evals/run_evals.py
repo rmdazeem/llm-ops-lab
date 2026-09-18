@@ -170,8 +170,8 @@ def main():
     body = ""
     for r in rows:
         doc = {"@timestamp": int(time.time() * 1000), "run_id": run_id, "qid": r[1], "question": r[2], "trace_id": r[3],
-               "must_refuse": bool(r[4]), "schema_ok": bool(r[8]), "citation_ok": bool(r[9]), "refusal_ok": bool(r[10]),
-               "correctness": r[11], "faithfulness": r[12], "hallucinated": bool(r[13]), "latency_s": r[15],
+               "must_refuse": int(r[4]), "schema_ok": int(r[8]), "citation_ok": int(r[9]), "refusal_ok": int(r[10]),   # 0/1 ints, not booleans:
+               "correctness": r[11], "faithfulness": r[12], "hallucinated": int(r[13]), "latency_s": r[15],         # Grafana can Average them
                "prompt_version": rca.PROMPT_VERSION, "judge_version": JUDGE_VERSION, "model": model, "corpus": rca.CORPUS.name}
         body += json.dumps({"index": {"_index": "llm-evals", "_id": f"{run_id}-{r[1]}"}}) + "\n" + json.dumps(doc) + "\n"
     code, _ = http("POST", "/_bulk?refresh=true", body)
