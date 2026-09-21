@@ -1,0 +1,58 @@
+# The RCA assistant service (image built with podman, imported into k3s containerd).
+# /health returns 503 while a dependency is down -> readiness gate: no traffic until Ollama + OpenSearch + k-NN index are reachable.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rca-config
+  namespace: llm-ops
+data:
+  OLLAMA_URL: "http://172.20.192.1:11434"     # Ollama on the Hyper-V host (Default Switch gateway); models stay on the laptop
+  OPENSEARCH_URL: "http://opensearch:9200"     # in-cluster Service DNS
+  RCA_TRACE_EXPORTER: "none"                   # spans still go to data/traces.jsonl inside the pod; loaded to OpenSearch by a job later
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rca-service
+  namespace: llm-ops
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: rca-service }
+  template:
+    metadata:
+      labels: { app: rca-service }
+    spec:
+      containers:
+        - name: rca-service
+          image: localhost/rca-service:0.4
+          imagePullPolicy: Never              # image was imported into containerd, never pulled from a registry
+          envFrom:
+            - configMapRef: { name: rca-config }
+          ports:
+            - { containerPort: 8080, name: http }
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits:   { cpu: "1",  memory: 1Gi }
+          startupProbe:                       # index build / OpenSearch attach can take a minute on first start
+            httpGet: { path: /health, port: 8080 }
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /docs, port: 8080 }   # process alive? (not /health — a dead dependency must not restart the pod)
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rca-service
+  namespace: llm-ops
+spec:
+  selector: { app: rca-service }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

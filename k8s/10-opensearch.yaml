@@ -1,0 +1,61 @@
+# OpenSearch, single node — traces, evals, alerts, runbook vectors (k-NN), tickets.
+# StatefulSet + PVC so data survives pod restarts (local-path provisioner ships with k3s).
+apiVersion: v1
+kind: Service
+metadata:
+  name: opensearch
+  namespace: llm-ops
+spec:
+  selector: { app: opensearch }
+  ports:
+    - name: http
+      port: 9200
+      targetPort: 9200
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: opensearch
+  namespace: llm-ops
+spec:
+  serviceName: opensearch
+  replicas: 1
+  selector:
+    matchLabels: { app: opensearch }
+  template:
+    metadata:
+      labels: { app: opensearch }
+    spec:
+      securityContext:
+        fsGroup: 1000                       # data dir writable by the opensearch user (uid 1000)
+      initContainers:
+        - name: sysctl                      # k-NN / Lucene needs vm.max_map_count >= 262144 on the NODE
+          image: docker.io/library/busybox:1.36
+          command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+          securityContext: { privileged: true }
+      containers:
+        - name: opensearch
+          image: docker.io/opensearchproject/opensearch:3.3.0
+          env:
+            - { name: discovery.type,                 value: single-node }
+            - { name: plugins.security.disabled,      value: "true" }        # lab only — same as the Windows install
+            - { name: OPENSEARCH_JAVA_OPTS,           value: "-Xms1g -Xmx1g" }
+            - { name: DISABLE_INSTALL_DEMO_CONFIG,    value: "true" }
+            - { name: DISABLE_SECURITY_PLUGIN,        value: "true" }
+          ports:
+            - { containerPort: 9200, name: http }
+          resources:
+            requests: { cpu: 500m, memory: 1500Mi }
+            limits:   { cpu: "2",  memory: 2Gi }
+          readinessProbe:
+            httpGet: { path: /_cluster/health, port: 9200 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/opensearch/data
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 10Gi } }
