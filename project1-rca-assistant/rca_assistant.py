@@ -33,8 +33,9 @@ PROMPT_VERSION = "v3"        # v3 = v2 prompt + guardrails (2d). bump when SYSTE
 LAST_TRACE_ID = None         # set by answer(); lets the eval runner link a score to its trace
 
 # v2: json_mode=True makes Ollama constrain the output to valid JSON (eval run v1: 1 of 7 answers was unparseable)
-Settings.llm = Ollama(model="qwen2.5:7b", request_timeout=600.0, temperature=0.1, json_mode=True)
-Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")   # P4: inside a pod "localhost" is the pod, not the host
+Settings.llm = Ollama(model="qwen2.5:7b", base_url=OLLAMA_URL, request_timeout=600.0, temperature=0.1, json_mode=True)
+Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text", base_url=OLLAMA_URL)
 Settings.node_parser = SentenceSplitter(chunk_size=700, chunk_overlap=80)
 
 # v1 -> v2 changes (from eval run 20260918T103812Z): root causes were generic / restated the question,

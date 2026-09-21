@@ -66,9 +66,9 @@ def _get(url, timeout=3):
 
 @app.get("/health")
 def health():
-    code, v = _get("http://localhost:11434/api/version")
+    code, v = _get(f"{rca.OLLAMA_URL}/api/version")
     ollama = {"ok": code == 200, "version": v.get("version")}
-    code, ps = _get("http://localhost:11434/api/ps")
+    code, ps = _get(f"{rca.OLLAMA_URL}/api/ps")
     ollama["loaded_models"] = [m["name"] for m in ps.get("models", [])] if code == 200 else []
     code, h = _get(f"{rca.OS_URL}/_cluster/health")
     opensearch = {"ok": code == 200, "status": h.get("status")}

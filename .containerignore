@@ -1,0 +1,11 @@
+.git
+.venv
+__pycache__
+corpus/
+data/traces.jsonl
+data/raw/
+project1-rca-assistant/index_store*/
+evals/results.sqlite
+NOTES_*.md
+tools/redact_patterns.local.json
+grafana/*.png
