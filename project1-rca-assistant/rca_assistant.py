@@ -92,11 +92,14 @@ def _opensearch_index():
 
 
 def build_or_load_index():
+    global VECTOR_STORE
     if VECTOR_STORE == "opensearch":
         try:
             return _opensearch_index()
         except Exception as e:                                         # OpenSearch down -> fall back to local files
             print(f"[index] OpenSearch vector store unavailable ({type(e).__name__}: {str(e)[:80]}) -> local index")
+            VECTOR_STORE = "local"                                     # the flag must follow the fallback: score normalisation,
+                                                                       # trace attribute and /health all read it (bug found in 3d)
     if INDEX_DIR.exists():
         return load_index_from_storage(StorageContext.from_defaults(persist_dir=str(INDEX_DIR)))
     print(f"[index] building local index from {CORPUS} (first run only) ...")
